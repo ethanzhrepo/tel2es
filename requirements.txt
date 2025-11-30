@@ -1,0 +1,30 @@
+# Telegram client
+telethon>=1.35.0
+
+# Configuration
+pyyaml>=6.0
+
+# Interactive UI
+prompt-toolkit>=3.0.30
+
+# Emoji handling
+emoji>=2.0.0
+
+# HTTP client for CoinGecko API
+aiohttp>=3.9.0
+
+# Elasticsearch client (version 9.2.0 for ES 9.2.1 server)
+elasticsearch[async]==9.2.0
+
+# FastAPI and server
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.5.0
+
+# Utilities
+regex>=2023.5.0
+python-dateutil>=2.8.2
+
+# Testing (optional)
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
