@@ -1,0 +1,68 @@
+
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.2.1
+    container_name: tel2es
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - ./data:/usr/share/elasticsearch/data
+    networks:
+      - tel2es 
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    user: "1000:0"
+
+  scraper:
+    build:
+      context: ../
+      dockerfile: Dockerfile
+    container_name: tel2es 
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    volumes:
+      - ./config:/app/config
+      - ../tests:/app/tests
+    networks:
+      - tel2es 
+    environment:
+      - PYTHONPATH=/app/src
+      - ES_HOST=http://elasticsearch:9200
+      - CONFIG_FILE=config/config.yml
+    working_dir: /app
+    command: python src/main.py start
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ../
+      dockerfile: Dockerfile
+    container_name: tel2es 
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./config:/app/config
+    networks:
+      - tel2es 
+    environment:
+      - PYTHONPATH=/app/src
+      - ES_HOST=http://elasticsearch:9200
+      - CONFIG_FILE=config/config.yml
+    working_dir: /app
+    command: python src/api.py
+    restart: unless-stopped
+
+networks:
+  tel2es:
+    driver: bridge
