@@ -2,7 +2,7 @@
 services:
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:9.2.1
-    container_name: tel2es
+    container_name: tel2es-elasticsearch
     environment:
       - discovery.type=single-node
       - xpack.security.enabled=false
@@ -24,7 +24,7 @@ services:
     build:
       context: ../
       dockerfile: Dockerfile
-    container_name: tel2es 
+    container_name: tel2es-scraper
     depends_on:
       elasticsearch:
         condition: service_healthy
@@ -45,7 +45,7 @@ services:
     build:
       context: ../
       dockerfile: Dockerfile
-    container_name: tel2es 
+    container_name: tel2es-api
     depends_on:
       elasticsearch:
         condition: service_healthy
