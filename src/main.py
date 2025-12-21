@@ -11,7 +11,7 @@ import time
 import logging
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 from telethon import TelegramClient, events
 from telethon.tl.types import Channel, Chat
@@ -652,6 +652,11 @@ class TelegramMonitor:
 
         logger.debug(f"Message text: {text[:100]}...")
 
+        message_dt = message.date
+        if message_dt.tzinfo is None:
+            message_dt = message_dt.replace(tzinfo=timezone.utc)
+        message_ts_ms = int(message_dt.timestamp() * 1000)
+
         message_data = {
             'message_id': message.id,
             'chat_id': chat_id,
@@ -661,7 +666,7 @@ class TelegramMonitor:
             'username': getattr(sender, 'username', None),
             'first_name': getattr(sender, 'first_name', None),
             'is_bot': getattr(sender, 'bot', False),
-            'timestamp': datetime.fromtimestamp(message.date.timestamp()),
+            'timestamp': message_ts_ms,
             'text': text,
             'raw_text': extracted_data.get('raw_text', text),
             'reply_to_message_id': message.reply_to_msg_id,

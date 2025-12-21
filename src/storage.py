@@ -4,7 +4,7 @@ Elasticsearch Storage for Telegram Messages
 
 import logging
 from typing import List, Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from elasticsearch import AsyncElasticsearch
 from elasticsearch.helpers import async_bulk
 
@@ -13,6 +13,22 @@ logger = logging.getLogger(__name__)
 
 class ElasticsearchClient:
     """Elasticsearch client for storing and querying Telegram messages"""
+
+    @staticmethod
+    def _coerce_timestamp_ms(value):
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, str):
+            try:
+                dt = datetime.fromisoformat(value)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return int(dt.timestamp() * 1000)
+            except ValueError:
+                return value
+        return value
 
     def __init__(self, hosts: List[str], index: str, username: str = '', password: str = ''):
         """
@@ -215,6 +231,7 @@ class ElasticsearchClient:
             hits = []
             for hit in response['hits']['hits']:
                 doc = hit['_source']
+                doc['timestamp'] = self._coerce_timestamp_ms(doc.get('timestamp'))
                 doc['_score'] = hit['_score']
                 hits.append(doc)
 
@@ -228,8 +245,8 @@ class ElasticsearchClient:
 
     async def get_latest_messages(
         self,
-        start_time: Optional[datetime] = None,
-        end_time: Optional[datetime] = None,
+        start_ms: Optional[int] = None,
+        end_ms: Optional[int] = None,
         limit: int = 10,
         offset: int = 0
     ) -> Dict[str, Any]:
@@ -237,8 +254,8 @@ class ElasticsearchClient:
         Get latest messages sorted by timestamp
 
         Args:
-            start_time: Start of time range
-            end_time: End of time range
+            start_ms: Start of time range (epoch milliseconds)
+            end_ms: End of time range (epoch milliseconds)
             limit: Maximum number of results
             offset: Offset for pagination
 
@@ -248,12 +265,12 @@ class ElasticsearchClient:
         query = {"bool": {"must": []}}
 
         # Add time range filter
-        if start_time or end_time:
+        if start_ms is not None or end_ms is not None:
             time_range = {}
-            if start_time:
-                time_range["gte"] = start_time.isoformat()
-            if end_time:
-                time_range["lte"] = end_time.isoformat()
+            if start_ms is not None:
+                time_range["gte"] = start_ms
+            if end_ms is not None:
+                time_range["lte"] = end_ms
 
             query["bool"]["must"].append({
                 "range": {
@@ -276,7 +293,9 @@ class ElasticsearchClient:
 
             hits = []
             for hit in response['hits']['hits']:
-                hits.append(hit['_source'])
+                doc = hit['_source']
+                doc['timestamp'] = self._coerce_timestamp_ms(doc.get('timestamp'))
+                hits.append(doc)
 
             return {
                 'total': response['hits']['total']['value'],

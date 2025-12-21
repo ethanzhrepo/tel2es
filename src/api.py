@@ -6,7 +6,7 @@ Provides search and retrieval endpoints for scraped messages
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 
@@ -36,6 +36,20 @@ es_client: Optional[ElasticsearchClient] = None
 monitor_health_path = Path('config/monitor_health.json')
 
 
+def _parse_epoch_ms(value: int) -> int:
+    ts = int(value)
+    if ts < 10**12:
+        raise ValueError("begin must be epoch milliseconds")
+    return ts
+
+
+def _parse_iso_to_epoch_ms(value: str) -> int:
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
 # Response models
 class MessageResponse(BaseModel):
     """Single message response"""
@@ -47,7 +61,7 @@ class MessageResponse(BaseModel):
     username: Optional[str] = None
     first_name: Optional[str] = None
     is_bot: bool = False
-    timestamp: datetime
+    timestamp: int = Field(..., description="Epoch milliseconds")
     text: str
     raw_text: Optional[str] = None
     reply_to_message_id: Optional[int] = None
@@ -225,7 +239,9 @@ async def get_latest_messages(
     start_time: Optional[str] = Query(None, description="Start time (ISO format: 2024-01-01T00:00:00)"),
     end_time: Optional[str] = Query(None, description="End time (ISO format: 2024-01-01T23:59:59)"),
     limit: int = Query(10, ge=1, le=100, description="Maximum number of results (1-100)"),
-    offset: int = Query(0, ge=0, description="Offset for pagination")
+    offset: int = Query(0, ge=0, description="Offset for pagination"),
+    begin: Optional[int] = Query(None, description="Begin timestamp (epoch milliseconds)"),
+    size: Optional[int] = Query(None, ge=1, le=100, description="Alias for limit (1-100)")
 ):
     """
     Get latest messages sorted by timestamp
@@ -238,14 +254,21 @@ async def get_latest_messages(
         raise HTTPException(status_code=503, detail="Elasticsearch client not initialized")
 
     try:
-        # Parse datetime strings
-        start_dt = datetime.fromisoformat(start_time) if start_time else None
-        end_dt = datetime.fromisoformat(end_time) if end_time else None
+        if size is not None:
+            limit = size
+
+        start_ms = None
+        if begin is not None:
+            start_ms = _parse_epoch_ms(begin)
+        elif start_time:
+            start_ms = _parse_iso_to_epoch_ms(start_time)
+
+        end_ms = _parse_iso_to_epoch_ms(end_time) if end_time else None
 
         # Get latest messages
         result = await es_client.get_latest_messages(
-            start_time=start_dt,
-            end_time=end_dt,
+            start_ms=start_ms,
+            end_ms=end_ms,
             limit=limit,
             offset=offset
         )
@@ -259,13 +282,15 @@ async def get_latest_messages(
             query={
                 "start_time": start_time,
                 "end_time": end_time,
+                "begin": begin,
                 "limit": limit,
+                "size": size,
                 "offset": offset
             }
         )
 
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid datetime format: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Get latest messages failed: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get latest messages: {str(e)}")
