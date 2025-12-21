@@ -37,6 +37,19 @@ telethon_logger = logging.getLogger('telethon')
 telethon_logger.setLevel(logging.WARNING)
 
 
+class TelethonWarningHandler(logging.Handler):
+    """Detect Telethon warnings that require resync."""
+
+    def __init__(self, callback):
+        super().__init__(level=logging.WARNING)
+        self._callback = callback
+
+    def emit(self, record):
+        message = record.getMessage()
+        if 'PersistentTimestampOutdatedError' in message:
+            self._callback('persistent timestamp outdated')
+
+
 class TelegramConfigUI:
     """Telegram configuration interactive UI"""
 
@@ -225,6 +238,282 @@ class TelegramMonitor:
         self.extractor = MessageExtractor()
         self.es_client = es_client
         self.running = False
+        self._loop = None
+        self._last_event_ts = time.monotonic()
+        self._last_seen_message_id: Dict[int, int] = {}
+        self._monitored_chat_map: Dict[int, Dict[str, Any]] = {}
+        self._monitored_entities: Dict[int, Any] = {}
+        self._resync_event = asyncio.Event()
+        self._resync_lock = asyncio.Lock()
+        self._resync_reason = None
+        self._last_resync_ts = 0.0
+        self._last_resync_wall_ts = None
+        self._last_resync_status = None
+        self._last_resync_reason = None
+        self._last_event_wall_ts = None
+        self._last_poll_wall_ts = None
+        self._watchdog_task = None
+        self._poller_task = None
+        self._telethon_log_handler = None
+        self._stall_seconds = 1800
+        self._watchdog_interval_seconds = 60
+        self._poll_interval_seconds = 300
+        self._poll_batch_limit = 200
+        self._min_resync_interval_seconds = 300
+        self._health_path = Path('config/monitor_health.json')
+        self._health_write_interval_seconds = 60
+        self._last_health_write_ts = 0.0
+        self._apply_monitoring_config()
+
+    @staticmethod
+    def _coerce_int(value, default):
+        try:
+            if value is None:
+                return default
+            value = int(value)
+            return value if value > 0 else default
+        except (TypeError, ValueError):
+            return default
+
+    def _apply_monitoring_config(self):
+        advanced = self.config.get_advanced_config() or {}
+        monitoring = advanced.get('monitoring', {})
+
+        self._stall_seconds = self._coerce_int(
+            monitoring.get('stall_seconds'),
+            self._stall_seconds
+        )
+        self._watchdog_interval_seconds = self._coerce_int(
+            monitoring.get('watchdog_interval_seconds'),
+            self._watchdog_interval_seconds
+        )
+        self._poll_interval_seconds = self._coerce_int(
+            monitoring.get('poll_interval_seconds'),
+            self._poll_interval_seconds
+        )
+        self._poll_batch_limit = self._coerce_int(
+            monitoring.get('poll_batch_limit'),
+            self._poll_batch_limit
+        )
+        self._min_resync_interval_seconds = self._coerce_int(
+            monitoring.get('min_resync_interval_seconds'),
+            self._min_resync_interval_seconds
+        )
+        self._health_write_interval_seconds = self._coerce_int(
+            monitoring.get('health_write_interval_seconds'),
+            self._health_write_interval_seconds
+        )
+
+    @staticmethod
+    def _normalize_chat_id(id_value):
+        """Normalize chat ID, handle -100 prefix."""
+        if isinstance(id_value, str):
+            id_value = int(id_value)
+
+        if id_value < 0 and str(abs(id_value)).startswith('100'):
+            return abs(id_value) - 1000000000000
+        return abs(id_value)
+
+    def _get_monitored_chat(self, chat_id):
+        normalized = self._normalize_chat_id(chat_id)
+        return self._monitored_chat_map.get(normalized)
+
+    def _mark_resync(self, reason):
+        self._resync_reason = reason
+        self._resync_event.set()
+
+    def _request_resync(self, reason):
+        if self._loop and self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._mark_resync, reason)
+        else:
+            self._mark_resync(reason)
+
+    def _install_telethon_log_handler(self):
+        if self._telethon_log_handler:
+            return
+        telethon_users_logger = logging.getLogger('telethon.client.users')
+        handler = TelethonWarningHandler(self._request_resync)
+        handler.setLevel(logging.WARNING)
+        telethon_users_logger.addHandler(handler)
+        self._telethon_log_handler = (telethon_users_logger, handler)
+
+    def _remove_telethon_log_handler(self):
+        if not self._telethon_log_handler:
+            return
+        telethon_users_logger, handler = self._telethon_log_handler
+        telethon_users_logger.removeHandler(handler)
+        self._telethon_log_handler = None
+
+    async def _prepare_monitoring_state(self, all_chats):
+        self._monitored_chat_map = {}
+        self._monitored_entities = {}
+        self._last_seen_message_id = {}
+
+        for chat in all_chats:
+            normalized = self._normalize_chat_id(chat['id'])
+            self._monitored_chat_map[normalized] = chat
+            self._last_seen_message_id.setdefault(normalized, 0)
+
+            entity = None
+            try:
+                entity = await self.client.get_input_entity(chat['id'])
+                self._monitored_entities[normalized] = entity
+            except Exception as exc:
+                logger.warning(
+                    "Failed to resolve chat entity for %s (ID: %s): %s",
+                    chat['title'],
+                    chat['id'],
+                    exc
+                )
+
+            try:
+                seed_target = entity or chat['id']
+                messages = await self.client.get_messages(seed_target, limit=1)
+                if messages:
+                    self._last_seen_message_id[normalized] = messages[0].id
+            except Exception as exc:
+                logger.warning(
+                    "Failed to read latest message for %s (ID: %s): %s",
+                    chat['title'],
+                    chat['id'],
+                    exc
+                )
+
+    async def _watchdog_loop(self):
+        while self.running:
+            await asyncio.sleep(self._watchdog_interval_seconds)
+            if not self.running:
+                break
+
+            stalled_for = time.monotonic() - self._last_event_ts
+            if self._resync_event.is_set():
+                reason = self._resync_reason or 'telethon warning'
+                await self._resync(reason)
+            elif stalled_for >= self._stall_seconds:
+                await self._resync(f'no messages for {int(stalled_for)}s')
+
+            await self._write_health_snapshot()
+
+    async def _poller_loop(self):
+        while self.running:
+            await asyncio.sleep(self._poll_interval_seconds)
+            if not self.running:
+                break
+            await self._poll_messages_once()
+            await self._write_health_snapshot()
+
+    async def _poll_messages_once(self):
+        for normalized, chat in self._monitored_chat_map.items():
+            entity = self._monitored_entities.get(normalized, chat['id'])
+            last_seen = self._last_seen_message_id.get(normalized, 0)
+
+            if last_seen == 0:
+                try:
+                    messages = await self.client.get_messages(entity, limit=1)
+                    if messages:
+                        self._last_seen_message_id[normalized] = messages[0].id
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to seed latest message for %s (ID: %s): %s",
+                        chat['title'],
+                        chat['id'],
+                        exc
+                    )
+                continue
+
+            try:
+                self._last_poll_wall_ts = time.time()
+                async for message in self.client.iter_messages(
+                    entity,
+                    min_id=last_seen,
+                    reverse=True,
+                    limit=self._poll_batch_limit
+                ):
+                    if message is None:
+                        continue
+                    if message.id <= self._last_seen_message_id.get(normalized, 0):
+                        continue
+                    chat_id = message.chat_id if message.chat_id is not None else chat['id']
+                    await self._process_message(chat_id, message, chat)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Poll fallback failed for %s (ID: %s): %s",
+                    chat['title'],
+                    chat['id'],
+                    exc
+                )
+        self._last_poll_wall_ts = time.time()
+
+    async def _write_health_snapshot(self, force=False):
+        now = time.monotonic()
+        if not force and now - self._last_health_write_ts < self._health_write_interval_seconds:
+            return
+        self._last_health_write_ts = now
+
+        def fmt_ts(ts_value):
+            if ts_value is None:
+                return None
+            return datetime.fromtimestamp(ts_value).isoformat()
+
+        payload = {
+            'status': 'running' if self.running else 'stopped',
+            'connected': bool(self.client and self.client.is_connected()),
+            'monitored_chats': len(self._monitored_chat_map),
+            'last_event_at': fmt_ts(self._last_event_wall_ts),
+            'last_event_age_seconds': None if self._last_event_wall_ts is None else max(0, time.time() - self._last_event_wall_ts),
+            'last_resync_at': fmt_ts(self._last_resync_wall_ts),
+            'last_resync_status': self._last_resync_status,
+            'last_resync_reason': self._last_resync_reason,
+            'last_poll_at': fmt_ts(self._last_poll_wall_ts),
+            'updated_at': datetime.now().isoformat()
+        }
+
+        data = json.dumps(payload, ensure_ascii=True, separators=(',', ':'))
+
+        def write_snapshot():
+            self._health_path.parent.mkdir(parents=True, exist_ok=True)
+            self._health_path.write_text(data, encoding='utf-8')
+
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, write_snapshot)
+        except Exception:
+            logger.warning("Failed to write health snapshot", exc_info=True)
+
+    async def _resync(self, reason):
+        async with self._resync_lock:
+            now = time.monotonic()
+            if now - self._last_resync_ts < self._min_resync_interval_seconds:
+                return
+
+            self._last_resync_ts = now
+            self._resync_event.clear()
+            self._last_resync_reason = reason
+            self._resync_reason = None
+            status = None
+
+            try:
+                if not self.client.is_connected():
+                    await self.client.connect()
+                if hasattr(self.client, 'catch_up'):
+                    await asyncio.wait_for(self.client.catch_up(), timeout=30)
+                else:
+                    await asyncio.wait_for(self.client.get_dialogs(limit=1), timeout=30)
+                logger.warning("Resync completed (%s)", reason)
+                status = 'success'
+            except asyncio.TimeoutError:
+                logger.warning("Resync timed out (%s)", reason)
+                status = 'timeout'
+            except Exception:
+                logger.warning("Resync failed (%s)", reason, exc_info=True)
+                status = 'error'
+            finally:
+                self._last_event_ts = time.monotonic()
+                self._last_resync_wall_ts = time.time()
+                self._last_resync_status = status
+                await self._write_health_snapshot(force=True)
 
     async def initialize(self):
         """Initialize Telegram client"""
@@ -277,6 +566,10 @@ class TelegramMonitor:
         for chat in all_chats:
             logger.info(f"  - {chat['title']} (ID: {chat['id']}, Type: {chat['type']})")
 
+        self._loop = asyncio.get_running_loop()
+        await self._prepare_monitoring_state(all_chats)
+        self._install_telethon_log_handler()
+
         # Register event handlers
         @self.client.on(events.NewMessage)
         async def handle_new_message(event):
@@ -298,12 +591,25 @@ class TelegramMonitor:
         logger.info("Monitoring started, press Ctrl+C to stop")
         logger.info("Waiting for messages...")
 
+        self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+        self._poller_task = asyncio.create_task(self._poller_loop())
+        await self._write_health_snapshot(force=True)
+
         try:
             await self.client.run_until_disconnected()
         except KeyboardInterrupt:
             logger.info("Stop signal received")
         finally:
             self.running = False
+            self._remove_telethon_log_handler()
+            for task in [self._watchdog_task, self._poller_task]:
+                if task:
+                    task.cancel()
+            await asyncio.gather(
+                *[task for task in [self._watchdog_task, self._poller_task] if task],
+                return_exceptions=True
+            )
+            await self._write_health_snapshot(force=True)
             if self.es_client:
                 await self.es_client.close()
 
@@ -312,101 +618,67 @@ class TelegramMonitor:
         try:
             # Check if this is a monitored chat
             chat_id = event.chat_id
-            monitoring_config = self.config.get_monitoring_config()
-            all_chats = monitoring_config.get('groups', []) + monitoring_config.get('channels', [])
-
             logger.debug(f"Processing message: Chat ID {chat_id}, Type {message_type}")
 
-            # Fix ID matching: handle Telegram's ID format differences
-            def normalize_chat_id(id_value):
-                """Normalize chat ID, handle -100 prefix"""
-                if isinstance(id_value, str):
-                    id_value = int(id_value)
-
-                # If negative and starts with -100, extract actual ID
-                if id_value < 0 and str(abs(id_value)).startswith('100'):
-                    return abs(id_value) - 1000000000000  # Remove -100 prefix
-                return abs(id_value)  # Use positive for comparison
-
-            normalized_event_id = normalize_chat_id(chat_id)
-
-            monitored_chat = None
-            for chat in all_chats:
-                config_id = normalize_chat_id(chat['id'])
-                if config_id == normalized_event_id:
-                    monitored_chat = chat
-                    break
-
+            monitored_chat = self._get_monitored_chat(chat_id)
             if not monitored_chat:
-                logger.debug(f"Chat ID {chat_id} (normalized: {normalized_event_id}) not in monitoring list, skipping")
-                logger.debug(f"Monitored IDs: {[normalize_chat_id(chat['id']) for chat in all_chats]}")
+                normalized_event_id = self._normalize_chat_id(chat_id)
+                logger.debug(
+                    "Chat ID %s (normalized: %s) not in monitoring list, skipping",
+                    chat_id,
+                    normalized_event_id
+                )
                 return
 
             logger.info(f"Processing message from '{monitored_chat['title']}'")
-
-            # Get message information
-            message = event.message
-            sender = await message.get_sender()
-
-            # Extract structured data
-            text = message.message or ''
-            extracted_data = await self.extractor.extract_data(text)
-
-            logger.debug(f"Message text: {text[:100]}...")
-
-            # Build message data
-            message_data = {
-                'message_id': message.id,
-                'chat_id': chat_id,
-                'chat_title': monitored_chat['title'],
-                'chat_type': monitored_chat['type'],
-                'user_id': sender.id if sender else None,
-                'username': getattr(sender, 'username', None),
-                'first_name': getattr(sender, 'first_name', None),
-                'is_bot': getattr(sender, 'bot', False),
-                'timestamp': datetime.fromtimestamp(message.date.timestamp()),
-                'text': text,
-                'raw_text': extracted_data.get('raw_text', text),
-                'reply_to_message_id': message.reply_to_msg_id,
-                'forward_from_chat_id': getattr(message.forward, 'chat_id', None) if message.forward else None,
-                'entities': self._extract_entities(message),
-                'media': self._extract_media(message),
-                'extracted_data': extracted_data
-            }
-
-            # Index to Elasticsearch
-            await self._store_message(message_data)
+            await self._process_message(chat_id, event.message, monitored_chat)
 
         except Exception as e:
             logger.error(f"Error processing message: {e}", exc_info=True)
+
+    async def _process_message(self, chat_id, message, monitored_chat):
+        """Process a message from events or poll fallback."""
+        self._last_event_ts = time.monotonic()
+        self._last_event_wall_ts = time.time()
+        normalized_event_id = self._normalize_chat_id(chat_id)
+        last_seen = self._last_seen_message_id.get(normalized_event_id, 0)
+        if message.id and message.id > last_seen:
+            self._last_seen_message_id[normalized_event_id] = message.id
+
+        sender = await message.get_sender()
+
+        text = message.message or ''
+        extracted_data = await self.extractor.extract_data(text)
+
+        logger.debug(f"Message text: {text[:100]}...")
+
+        message_data = {
+            'message_id': message.id,
+            'chat_id': chat_id,
+            'chat_title': monitored_chat['title'],
+            'chat_type': monitored_chat['type'],
+            'user_id': sender.id if sender else None,
+            'username': getattr(sender, 'username', None),
+            'first_name': getattr(sender, 'first_name', None),
+            'is_bot': getattr(sender, 'bot', False),
+            'timestamp': datetime.fromtimestamp(message.date.timestamp()),
+            'text': text,
+            'raw_text': extracted_data.get('raw_text', text),
+            'reply_to_message_id': message.reply_to_msg_id,
+            'forward_from_chat_id': getattr(message.forward, 'chat_id', None) if message.forward else None,
+            'entities': self._extract_entities(message),
+            'media': self._extract_media(message),
+            'extracted_data': extracted_data
+        }
+
+        await self._store_message(message_data)
 
     async def _handle_delete(self, event):
         """Handle delete event"""
         try:
             # Check if this is a monitored chat
             chat_id = event.chat_id
-            monitoring_config = self.config.get_monitoring_config()
-            all_chats = monitoring_config.get('groups', []) + monitoring_config.get('channels', [])
-
-            # Use same ID normalization logic
-            def normalize_chat_id(id_value):
-                """Normalize chat ID, handle -100 prefix"""
-                if isinstance(id_value, str):
-                    id_value = int(id_value)
-
-                if id_value < 0 and str(abs(id_value)).startswith('100'):
-                    return abs(id_value) - 1000000000000
-                return abs(id_value)
-
-            normalized_event_id = normalize_chat_id(chat_id)
-
-            monitored_chat = None
-            for chat in all_chats:
-                config_id = normalize_chat_id(chat['id'])
-                if config_id == normalized_event_id:
-                    monitored_chat = chat
-                    break
-
+            monitored_chat = self._get_monitored_chat(chat_id)
             if not monitored_chat:
                 logger.debug(f"Delete event: Chat ID {chat_id} not in monitoring list, skipping")
                 return
@@ -477,7 +749,7 @@ class TelegramMonitor:
 
         # Also print to console for debugging
         message_json = json.dumps(message_data, ensure_ascii=False, separators=(',', ':'), default=str)
-        print(f"[{datetime.now().isoformat()}] {message_json}")
+        logger.info("Message payload: %s", message_json)
 
 
 async def main():

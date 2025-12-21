@@ -4,9 +4,11 @@ FastAPI REST Server for Telegram Scraper
 Provides search and retrieval endpoints for scraped messages
 """
 
+import json
 import logging
 from datetime import datetime
 from typing import Optional, List, Dict, Any
+from pathlib import Path
 
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import JSONResponse
@@ -31,6 +33,7 @@ app = FastAPI(
 
 # Global Elasticsearch client
 es_client: Optional[ElasticsearchClient] = None
+monitor_health_path = Path('config/monitor_health.json')
 
 
 # Response models
@@ -75,6 +78,7 @@ class HealthResponse(BaseModel):
     elasticsearch: str
     index: str
     timestamp: datetime
+    ingest: Optional[Dict[str, Any]] = None
 
 
 @app.on_event("startup")
@@ -142,11 +146,19 @@ async def health_check():
         logger.error(f"Elasticsearch health check failed: {e}")
         es_status = "disconnected"
 
+    ingest = None
+    if monitor_health_path.exists():
+        try:
+            ingest = json.loads(monitor_health_path.read_text(encoding='utf-8'))
+        except Exception as e:
+            ingest = {"status": "unavailable", "error": str(e)}
+
     return HealthResponse(
         status="healthy" if es_status == "connected" else "unhealthy",
         elasticsearch=es_status,
         index=es_client.index,
-        timestamp=datetime.now()
+        timestamp=datetime.now(),
+        ingest=ingest
     )
 
 

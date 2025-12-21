@@ -1,4 +1,4 @@
-.PHONY: help start stop restart login config test logs health clean check-config backup restore list-backups query
+.PHONY: help start stop restart login config test logs logs-api logs-all health clean check-config build rebuild status shell shell-api backup restore list-backups query
 
 # Project paths
 PROJECT_ROOT := ../
@@ -19,10 +19,17 @@ help:
 	@echo "make login       - Login to Telegram (first time setup)"
 	@echo "make config      - Configure monitored channels/groups"
 	@echo "make test        - Run tests"
-	@echo "make logs         - View scraper logs"
-	@echo "make health       - Check service health"
-	@echo "make clean        - Stop services and remove volumes"
+	@echo "make logs        - View scraper logs"
+	@echo "make logs-api    - View API logs"
+	@echo "make logs-all    - View all logs"
+	@echo "make health      - Check service health"
+	@echo "make clean       - Stop services and remove volumes"
 	@echo "make check-config - Check and setup configuration"
+	@echo "make build       - Build Docker images"
+	@echo "make rebuild     - Rebuild Docker images (no cache)"
+	@echo "make status      - Show container status"
+	@echo "make shell       - Open shell in scraper container"
+	@echo "make shell-api   - Open shell in API container"
 	@echo ""
 	@echo "=== Data Management ==="
 	@echo "make backup       - Backup Elasticsearch data"

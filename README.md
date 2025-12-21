@@ -53,6 +53,32 @@ The REST API runs on `http://localhost:8000`
 curl http://localhost:8000/health
 ```
 
+The response includes an optional `ingest` field that reflects the scraper runtime health
+from `config/monitor_health.json` when the scraper is running.
+
+Example:
+
+```json
+{
+  "status": "healthy",
+  "elasticsearch": "connected",
+  "index": "telegram_messages",
+  "timestamp": "2025-01-01T12:00:00.000000",
+  "ingest": {
+    "status": "running",
+    "connected": true,
+    "monitored_chats": 3,
+    "last_event_at": "2025-01-01T12:00:10.000000",
+    "last_event_age_seconds": 5.2,
+    "last_resync_at": "2025-01-01T11:55:00.000000",
+    "last_resync_status": "success",
+    "last_resync_reason": "persistent timestamp outdated",
+    "last_poll_at": "2025-01-01T12:00:00.000000",
+    "updated_at": "2025-01-01T12:00:10.000000"
+  }
+}
+```
+
 ### Search Messages
 
 ```bash
@@ -71,4 +97,20 @@ curl "http://localhost:8000/latest?limit=10"
 
 # Get latest messages in time range
 curl "http://localhost:8000/latest?start_time=2024-01-01T00:00:00&end_time=2024-01-31T23:59:59&limit=50"
+```
+
+## Monitoring Recovery Settings
+
+The scraper uses a watchdog + poll fallback to recover from stalled Telegram updates.
+Adjust these in `config.yml` under `advanced.monitoring`:
+
+```yaml
+advanced:
+  monitoring:
+    stall_seconds: 1800                 # Trigger resync after no messages for N seconds
+    watchdog_interval_seconds: 60       # Health check interval
+    poll_interval_seconds: 300          # Fallback poll interval
+    poll_batch_limit: 200               # Max messages per poll batch
+    min_resync_interval_seconds: 300    # Minimum seconds between resync attempts
+    health_write_interval_seconds: 60   # Health snapshot write interval
 ```

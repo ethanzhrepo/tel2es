@@ -1,5 +1,5 @@
 # Telegram client
-telethon>=1.35.0
+telethon==1.42.0
 
 # Configuration
 pyyaml>=6.0

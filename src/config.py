@@ -61,6 +61,14 @@ class TelegramConfig:
                     'extract_addresses': True,
                     'extract_symbols': True,
                     'sentiment_analysis': True
+                },
+                'monitoring': {
+                    'stall_seconds': 1800,
+                    'watchdog_interval_seconds': 60,
+                    'poll_interval_seconds': 300,
+                    'poll_batch_limit': 200,
+                    'min_resync_interval_seconds': 300,
+                    'health_write_interval_seconds': 60
                 }
             }
         }
