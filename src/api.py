@@ -6,7 +6,7 @@ Provides search and retrieval endpoints for scraped messages
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 
@@ -42,12 +42,6 @@ def _parse_epoch_ms(value: int) -> int:
         raise ValueError("begin must be epoch milliseconds")
     return ts
 
-
-def _parse_iso_to_epoch_ms(value: str) -> int:
-    dt = datetime.fromisoformat(value)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return int(dt.timestamp() * 1000)
 
 
 # Response models
@@ -236,8 +230,6 @@ async def search_messages(
 
 @app.get("/latest", response_model=LatestResponse)
 async def get_latest_messages(
-    start_time: Optional[str] = Query(None, description="Start time (ISO format: 2024-01-01T00:00:00)"),
-    end_time: Optional[str] = Query(None, description="End time (ISO format: 2024-01-01T23:59:59)"),
     limit: int = Query(10, ge=1, le=100, description="Maximum number of results (1-100)"),
     offset: int = Query(0, ge=0, description="Offset for pagination"),
     begin: Optional[int] = Query(None, description="Begin timestamp (epoch milliseconds)"),
@@ -260,15 +252,10 @@ async def get_latest_messages(
         start_ms = None
         if begin is not None:
             start_ms = _parse_epoch_ms(begin)
-        elif start_time:
-            start_ms = _parse_iso_to_epoch_ms(start_time)
-
-        end_ms = _parse_iso_to_epoch_ms(end_time) if end_time else None
 
         # Get latest messages
         result = await es_client.get_latest_messages(
             start_ms=start_ms,
-            end_ms=end_ms,
             limit=limit,
             offset=offset
         )
@@ -280,8 +267,6 @@ async def get_latest_messages(
             total=result['total'],
             hits=messages,
             query={
-                "start_time": start_time,
-                "end_time": end_time,
                 "begin": begin,
                 "limit": limit,
                 "size": size,

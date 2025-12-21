@@ -246,7 +246,6 @@ class ElasticsearchClient:
     async def get_latest_messages(
         self,
         start_ms: Optional[int] = None,
-        end_ms: Optional[int] = None,
         limit: int = 10,
         offset: int = 0
     ) -> Dict[str, Any]:
@@ -255,7 +254,6 @@ class ElasticsearchClient:
 
         Args:
             start_ms: Start of time range (epoch milliseconds)
-            end_ms: End of time range (epoch milliseconds)
             limit: Maximum number of results
             offset: Offset for pagination
 
@@ -265,12 +263,10 @@ class ElasticsearchClient:
         query = {"bool": {"must": []}}
 
         # Add time range filter
-        if start_ms is not None or end_ms is not None:
+        if start_ms is not None:
             time_range = {}
             if start_ms is not None:
                 time_range["gte"] = start_ms
-            if end_ms is not None:
-                time_range["lte"] = end_ms
 
             query["bool"]["must"].append({
                 "range": {

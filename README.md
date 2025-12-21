@@ -103,8 +103,6 @@ curl "http://localhost:8000/latest?begin=1700000000000&size=100&offset=0"
 # Next page (offset-based)
 curl "http://localhost:8000/latest?begin=1700000000000&size=100&offset=100"
 
-# Get latest messages in time range
-curl "http://localhost:8000/latest?start_time=2024-01-01T00:00:00&end_time=2024-01-31T23:59:59&limit=50"
 ```
 
 ## Monitoring Recovery Settings
