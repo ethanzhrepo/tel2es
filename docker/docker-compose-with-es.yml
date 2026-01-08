@@ -17,7 +17,7 @@ services:
       test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 30
     user: "1000:0"
 
   scraper:
